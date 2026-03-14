@@ -8,7 +8,7 @@ import datetime
 import psutil
 import os
 import logging
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional, Tuple
 import threading
 
 logging.basicConfig(
@@ -23,6 +23,8 @@ WLCMID = 1479676935683575963
 FLOOD_CHANNEL_ID = 1482030865650286615
 COOLDOWN_DURATION = 10
 OWNER_IDS = {1412756800767393873}
+MAX_DMS_PER_BOT = 10  # Each bot sends at most 10 DMs per flood
+EXTRA_BOT_STARTUP_DELAY = 3  # Seconds to wait for extra bots to connect before flooding
 
 
 
@@ -61,6 +63,8 @@ class BotManager:
     def __init__(self):
         self.bots: List[FloodBot] = []
         self.main_bot: FloodBot = None
+        self.main_token: Optional[str] = None
+        self.extra_tokens: List[str] = []
         self.valid_tokens: List[str] = []
         self.invalid_tokens: List[str] = []
         self.flood_cooldowns: Dict[int, float] = {}
@@ -68,17 +72,19 @@ class BotManager:
         self.total_dms = 0
         self.start_time = None
 
-    async def validate_token(self, token: str) -> bool:
+    async def validate_token(self, token: str) -> Tuple[bool, Optional[int]]:
+        """Validate token and return (is_valid, user_id)."""
         try:
             bot = FloodBot(token)
             await bot.login(token)
+            uid = bot.user.id
             await bot.close()
-            return True
+            return True, uid
         except (discord.errors.LoginFailure, discord.errors.HTTPException):
-            return False
+            return False, None
         except Exception as e:
             logger.error(f"Unknown error validating token: {str(e)}")
-            return False
+            return False, None
 
     async def load_tokens(self) -> bool:
         try:
@@ -91,10 +97,14 @@ class BotManager:
             tasks = [self.validate_token(token) for token in tokens]
             validation_results = await asyncio.gather(*tasks)
             
-            for token, is_valid in zip(tokens, validation_results):
+            for token, (is_valid, uid) in zip(tokens, validation_results):
                 if is_valid:
                     self.valid_tokens.append(token)
-                    logger.info(f"Token valid: {token[:20]}...")
+                    logger.info(f"Token valid: {token[:20]}... (ID: {uid})")
+                    if uid == MAINIDD:
+                        self.main_token = token
+                    else:
+                        self.extra_tokens.append(token)
                 else:
                     self.invalid_tokens.append(token)
                     logger.info(f"Token invalid: {token[:20]}...")
@@ -102,6 +112,14 @@ class BotManager:
             logger.info(f"\nValidation complete:")
             logger.info(f"Valid tokens: {len(self.valid_tokens)}")
             logger.info(f"Invalid tokens: {len(self.invalid_tokens)}")
+            logger.info(f"Main bot token found: {self.main_token is not None}")
+            logger.info(f"Extra bot tokens: {len(self.extra_tokens)}")
+
+            # Fallback: if MAINIDD not matched, treat the first valid token as main
+            if not self.main_token and self.valid_tokens:
+                self.main_token = self.valid_tokens[0]
+                self.extra_tokens = self.valid_tokens[1:]
+                logger.warning("Main bot not identified by MAINIDD; using first valid token as main.")
             
             if self.invalid_tokens:
                 async with aiofiles.open('invalid_tokens.txt', 'w') as f:
@@ -115,7 +133,52 @@ class BotManager:
             logger.error(f"Error loading tokens: {str(e)}")
             return False
             
-        return bool(self.valid_tokens)
+        return bool(self.main_token)
+
+    async def load_premium_users(self) -> Set[int]:
+        try:
+            async with aiofiles.open('premium.json', 'r') as f:
+                content = await f.read()
+                return set(json.loads(content))
+        except FileNotFoundError:
+            async with aiofiles.open('premium.json', 'w') as f:
+                await f.write('[]')
+            return set()
+
+    async def save_premium_users(self, premium_users: Set[int]):
+        async with aiofiles.open('premium.json', 'w') as f:
+            await f.write(json.dumps(list(premium_users)))
+
+    async def start_extra_bots(self) -> Tuple[List[FloodBot], List[asyncio.Task]]:
+        """Start extra bots for flooding. Returns (extra_bots, tasks)."""
+        extra_bots: List[FloodBot] = []
+        tasks: List[asyncio.Task] = []
+        for token in self.extra_tokens:
+            bot = FloodBot(token)
+            await self.setup_bot_commands(bot)
+            extra_bots.append(bot)
+            self.bots.append(bot)
+            task = asyncio.create_task(bot.start(token))
+            tasks.append(task)
+        if extra_bots:
+            # Allow extra bots time to connect before flooding
+            await asyncio.sleep(EXTRA_BOT_STARTUP_DELAY)
+        return extra_bots, tasks
+
+    async def stop_extra_bots(self, extra_bots: List[FloodBot], tasks: List[asyncio.Task]):
+        """Stop and remove extra bots after flooding."""
+        for bot in extra_bots:
+            try:
+                self.bots.remove(bot)
+            except ValueError:
+                pass
+            try:
+                await bot.close()
+            except Exception:
+                pass
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
     async def setup_bot_commands(self, bot: FloodBot):
         bot.remove_command("help")
@@ -183,6 +246,82 @@ class BotManager:
                 color=discord.Color.blue()
             )
         
+            await ctx.send(embed=embed)
+
+        @bot.command(name="premium")
+        async def premium_command(ctx, action: str = None, user: discord.User = None):
+            if bot.user.id != MAINIDD:
+                return
+
+            if ctx.author.id not in OWNER_IDS:
+                embed = discord.Embed(
+                    description="Only owners can manage premium users!",
+                    color=discord.Color.red()
+                )
+                await ctx.send(embed=embed)
+                return
+
+            if action is None or action.lower() not in ("add", "rem", "list"):
+                embed = discord.Embed(
+                    description="Usage: `.premium add/rem/list (@user)`",
+                    color=discord.Color.red()
+                )
+                await ctx.send(embed=embed)
+                return
+
+            premium_users = await self.load_premium_users()
+
+            if action.lower() == "list":
+                if not premium_users:
+                    embed = discord.Embed(
+                        description="No premium users.",
+                        color=discord.Color.blue()
+                    )
+                else:
+                    user_mentions = "\n".join(f"<@{uid}>" for uid in premium_users)
+                    embed = discord.Embed(
+                        title="Premium Users",
+                        description=user_mentions,
+                        color=discord.Color.gold()
+                    )
+                await ctx.send(embed=embed)
+                return
+
+            if user is None:
+                embed = discord.Embed(
+                    description=f"Usage: `.premium {action} @user`",
+                    color=discord.Color.red()
+                )
+                await ctx.send(embed=embed)
+                return
+
+            if action.lower() == "add":
+                if user.id in premium_users:
+                    embed = discord.Embed(
+                        description=f"{user.mention} is already a premium user!",
+                        color=discord.Color.orange()
+                    )
+                else:
+                    premium_users.add(user.id)
+                    await self.save_premium_users(premium_users)
+                    embed = discord.Embed(
+                        description=f"{user.mention} has been added to premium!",
+                        color=discord.Color.green()
+                    )
+            elif action.lower() == "rem":
+                if user.id not in premium_users:
+                    embed = discord.Embed(
+                        description=f"{user.mention} is not a premium user!",
+                        color=discord.Color.orange()
+                    )
+                else:
+                    premium_users.discard(user.id)
+                    await self.save_premium_users(premium_users)
+                    embed = discord.Embed(
+                        description=f"{user.mention} has been removed from premium!",
+                        color=discord.Color.green()
+                    )
+
             await ctx.send(embed=embed)
 
         @bot.command(name="unsecure")
@@ -284,6 +423,7 @@ class BotManager:
             help_embed.add_field(name=".unsecure", value="Unsecures yourself or another user (only for owners).", inline=False)
             help_embed.add_field(name=".flood @user (reason)", value="Floods the target user's DMs with the given reason.", inline=False)
             help_embed.add_field(name=".stats", value="Shows bot statistics like active bots and secured users.", inline=False)
+            help_embed.add_field(name=".premium add/rem/list (@user)", value="Manage premium users (owners only). Premium users can flood secured users.", inline=False)
             
 
             await ctx.send(embed=help_embed)
@@ -303,13 +443,17 @@ class BotManager:
                 await ctx.send(embed=embed)
                 return
 
+            # Check if requester is owner or premium (bypasses secure)
+            premium_users = await self.load_premium_users()
+            is_privileged = ctx.author.id in OWNER_IDS or ctx.author.id in premium_users
+
             try:
                 with open("secure.json", "r") as file:
                     secure_users = json.load(file)
             except FileNotFoundError:
                 secure_users = []
 
-            if user.id in secure_users:
+            if user.id in secure_users and not is_privileged:
                 embed = discord.Embed(
                     description=f"{user.mention} is secured. You can't flood their DMs!",
                     color=discord.Color.red()
@@ -325,12 +469,16 @@ class BotManager:
                 await ctx.send(embed=embed)
                 return
 
+            # Start extra bots for this flood operation
+            extra_bots, extra_tasks = await self.start_extra_bots()
+            all_flood_bots = self.bots[:]
+
             self.start_time = datetime.datetime.now()
             self.total_dms = 0
 
             embed = discord.Embed(
                 title="Starting DM Flood",
-                description=f"Target: {user.mention}\nReason: {reason}\nTotal Bots: {len(self.bots)}",
+                description=f"Target: {user.mention}\nReason: {reason}\nTotal Bots: {len(all_flood_bots)}",
                 color=discord.Color.blue()
             )
             status_msg = await ctx.send(embed=embed)
@@ -346,7 +494,7 @@ class BotManager:
 
             flood_done_event = asyncio.Event()
             flood_tasks_done = 0
-            total_flood_bots = len(self.bots)
+            total_flood_bots = len(all_flood_bots)
 
             async def update_status():
                 while not flood_done_event.is_set():
@@ -360,7 +508,7 @@ class BotManager:
                             f"Total DMs Sent `:` `{self.total_dms}`\n"
                             f"DMs per Second `:` `{dms_per_second:.2f}`\n"
                             f"Duration `:` `{duration:.1f}s`\n"
-                            f"Active Bots `:` `{len(self.bots)}`"
+                            f"Active Bots `:` `{len(all_flood_bots)}`"
                         ),
                         color=discord.Color.blue()
                     )
@@ -386,8 +534,7 @@ class BotManager:
                 try:
                     target_user = await flood_bot.fetch_user(user.id)
                     dm_count = 0
-                    max_dms = 99
-                    while dm_count < max_dms:
+                    while dm_count < MAX_DMS_PER_BOT:
                         try:
                             await target_user.send(embed=flood_message)
                             await flood_bot.increment_dm_count()
@@ -407,8 +554,16 @@ class BotManager:
                         flood_done_event.set()
 
             asyncio.create_task(update_status())
-            for flood_bot in self.bots:
+            for flood_bot in all_flood_bots:
                 asyncio.create_task(send_dms_from_bot(flood_bot))
+
+            # If somehow no bots are available, mark flood as done immediately
+            if total_flood_bots == 0:
+                flood_done_event.set()
+
+            # Wait for all DM tasks to finish, then shut down extra bots
+            await flood_done_event.wait()
+            await self.stop_extra_bots(extra_bots, extra_tasks)
 
         
 
@@ -427,7 +582,7 @@ class BotManager:
             bot = FloodBot(token)
             await self.setup_bot_commands(bot)
             self.bots.append(bot)
-            if not self.main_bot and MAINIDD:
+            if not self.main_bot:
                 self.main_bot = bot
             await bot.start(token)
             return True
@@ -435,19 +590,14 @@ class BotManager:
             logger.error(f"Failed to start bot: {str(e)}")
             return False
 
-    async def start_all_bots(self):
-        if not self.valid_tokens:
-            logger.error("No valid tokens available!")
+    async def start_main_bot_only(self):
+        """Start only the main bot. Extra bots are started on demand during flood."""
+        if not self.main_token:
+            logger.error("Main bot token not found!")
             return
 
-        logger.info("\nStarting bots...")
-        tasks = []
-        for token in self.valid_tokens:
-            task = asyncio.create_task(self.start_bot(token))
-            tasks.append(task)
-            await asyncio.sleep(1)
-            
-        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Starting main bot only (extra bots will start on .flood)...")
+        await self.start_bot(self.main_token)
 
     async def cleanup(self):
         for bot in self.bots:
@@ -460,7 +610,7 @@ async def main():
     manager = BotManager()
     try:
         if await manager.load_tokens():
-            await manager.start_all_bots()
+            await manager.start_main_bot_only()
         else:
             logger.error("Failed to load any valid tokens. Exiting...")
     except KeyboardInterrupt:
